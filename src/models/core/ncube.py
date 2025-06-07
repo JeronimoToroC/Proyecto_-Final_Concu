@@ -1,7 +1,26 @@
 from dataclasses import dataclass
 from numpy.typing import NDArray
 import numpy as np
+from dataclasses import dataclass
+from numpy.typing import NDArray
+import pycuda.autoinit
+import pycuda.driver as drv
+from pycuda.compiler import SourceModule
+from pycuda.tools import make_default_context
+import os
 
+os.environ["CUDA_PATH"] = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8"
+os.environ["PATH"] = f"{os.environ['CUDA_PATH']}\\bin;{os.environ['PATH']}"
+
+try:
+    import pycuda.autoinit
+    import pycuda.driver as drv
+    from pycuda.compiler import SourceModule
+    from pycuda.tools import make_default_context
+    CUDA_AVAILABLE = True
+except Exception as e:
+    print(f"[CUDA] Advertencia: PyCUDA no disponible - {str(e)}")
+    CUDA_AVAILABLE = False
 
 @dataclass(frozen=True)
 class NCube:
@@ -16,16 +35,83 @@ class NCube:
     dims: NDArray[np.int8]
     data: np.ndarray
 
-    def __post_init__(self):
-        """Validación de tamaño y dimensionalidad tras inicialización.
+    # Configuración CUDA
+    _CUDA_INITIALIZED = False
+    _CUDA_PATH = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+    _context = None
+    _mod = None
+    _marginalize_kernel = None
+    
+    _MARGINALIZE_KERNEL_CODE = """
+    __global__ void marginalize_kernel(
+        const float *input,
+        float *output,
+        const int input_size,
+        const int output_size,
+        const int reduce_stride
+    ) {
+        int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (out_idx >= output_size) return;
+        
+        float sum = 0.0f;
+        int count = 0;
+        
+        for(int i = out_idx * reduce_stride; i < (out_idx+1) * reduce_stride; i++) {
+            if(i < input_size) {
+                sum += input[i];
+                count++;
+            }
+        }
+        
+        if(count > 0) {
+            output[out_idx] = sum / count;
+        }
+    }
+    """
+    
+    @classmethod
+    def _initialize_cuda(cls):
+        """Inicialización segura del entorno CUDA"""
+        if cls._CUDA_INITIALIZED:
+            return
+            
+        try:
+            # Configurar entorno
+            os.environ["CUDA_PATH"] = cls._CUDA_PATH
+            os.environ["PATH"] = f"{cls._CUDA_PATH}\\bin;{os.environ['PATH']}"
+            
+            # Verificar dispositivo
+            device = drv.Device(0)
+            print(f"[CUDA] Configurando para dispositivo: {device.name()}")
+            
+            cls._context = make_default_context()
+            
+            # Compilar kernel
+            cls._mod = SourceModule(
+                cls._MARGINALIZE_KERNEL_CODE,
+                options=['-arch=sm_75', '--ptxas-options=-v'],
+                no_extern_c=True
+            )
+            cls._marginalize_kernel = cls._mod.get_function("marginalize_kernel")
+            
+            cls._CUDA_INITIALIZED = True
+            
+        except Exception as e:
+            print(f"[CUDA] Error de inicialización: {str(e)}")
+            cls._CUDA_INITIALIZED = False
 
-        Raises:
-            ValueError: Se valida que hayan dimensiones y cumpla con las dimensiones de un cubo n-dimensional.
-        """
+    def __post_init__(self):
+        """Validación de datos + inicialización CUDA"""
         if self.dims.size and self.data.shape != (2,) * self.dims.size:
             raise ValueError(
                 f"Forma inválida {self.data.shape} para dimensiones {self.dims}"
             )
+        
+        # Asegurar tipo float32 para CUDA
+        object.__setattr__(self, 'data', self.data.astype(np.float32))
+        
+        # Inicializar CUDA silenciosamente
+        self._initialize_cuda()
 
     def condicionar(
         self,
@@ -86,47 +172,102 @@ class NCube:
             dims=nuevas_dims,
             indice=self.indice,
         )
+    indice: int
+    dims: NDArray[np.int8]
+    data: np.ndarray
+
+    # Configuración CUDA
+    _CUDA_INITIALIZED = False
+    _CUDA_PATH = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+    
+    if CUDA_AVAILABLE:
+        _MARGINALIZE_KERNEL_CODE = """
+        __global__ void marginalize_kernel(
+            const float *input,
+            float *output,
+            const int input_size,
+            const int output_size,
+            const int reduce_stride
+        ) {
+            int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (out_idx >= output_size) return;
+            
+            float sum = 0.0f;
+            int count = 0;
+            
+            for(int i = out_idx * reduce_stride; i < (out_idx+1) * reduce_stride; i++) {
+                if(i < input_size) {
+                    sum += input[i];
+                    count++;
+                }
+            }
+            
+            if(count > 0) {
+                output[out_idx] = sum / count;
+            }
+        }
+        """
+    else:
+        _MARGINALIZE_KERNEL_CODE = None
+
+    @classmethod
+    def _initialize_cuda(cls):
+        """Inicialización segura del entorno CUDA"""
+        if not CUDA_AVAILABLE or cls._CUDA_INITIALIZED:
+            return
+            
+        try:
+            # Configurar entorno
+            os.environ["CUDA_PATH"] = cls._CUDA_PATH
+            os.environ["PATH"] = f"{cls._CUDA_PATH}\\bin;{os.environ['PATH']}"
+            
+            # Verificar dispositivo
+            device = drv.Device(0)
+            print(f"[CUDA] Configurando para dispositivo: {device.name()}")
+            
+            # Crear contexto
+            cls._context = make_default_context()
+            
+            # Compilar kernel
+            cls._mod = SourceModule(
+                cls._MARGINALIZE_KERNEL_CODE,
+                options=['-arch=sm_75'],
+                no_extern_c=True
+            )
+            cls._marginalize_kernel = cls._mod.get_function("marginalize_kernel")
+            
+            cls._CUDA_INITIALIZED = True
+            
+        except Exception as e:
+            print(f"[CUDA] Error de inicialización: {str(e)}")
+            cls._CUDA_INITIALIZED = False
+            if hasattr(cls, '_context') and cls._context:
+                cls._context.pop()
+
+    def __post_init__(self):
+        """Validación de datos"""
+        if self.dims.size and self.data.shape != (2,) * self.dims.size:
+            raise ValueError(
+                f"Forma inválida {self.data.shape} para dimensiones {self.dims}"
+            )
+        
+        # Asegurar tipo float32
+        object.__setattr__(self, 'data', self.data.astype(np.float32))
+        
+        # Inicializar CUDA solo si está disponible
+        if CUDA_AVAILABLE:
+            self._initialize_cuda()
 
     def marginalizar(self, ejes: NDArray[np.int8]) -> "NCube":
         """
-        Marginalizar a nivel del n-cubo permite acoplar o colapsar una o más dimensiones manteniendo la probabilidad condicional.
-        El n-cubo puede esquematizarse de forma tal que se aprecie el solapamiento y promedio ente caras, donde la dimensión más baja es el primer desplazamiento dimensional sobre el arreglo.
-        Es importante validar la intersección de ejes puesto es una rutina llamada en sistema desde marginalizar como particionar.
-
-        Args:
-        ----
-            ejes (NDArray[np.int8]): Arreglo con las dimensiones a marginalizar o eliminar. Se valida que los ejes o dimensiones dadas estén y finalmente alineamos nuevamente con las dimensiones locales, donde con numpy debemos hacer uso de la dimensión complementaria para alinear la dimensión externa a la más interna.
-
-        Returns:
-        -------
-            NCube: El n-cubo marginalizado en las dimensiones dadas. Donde es equivalente el marginalizar sobre (a, b,) que primero en (a,) y luego en (b,) o viceversa.
-
-        Example:
-        -------
-            >>> dimensiones = np.array([2, 3])
-            >>> mi_ncubo
-            NCube(index=0):
-            dims=[0 1 2]
-            shape=(2, 2, 2)
-            data=
-                [[[0. 0.]
-                [1. 1.]],
-                [[1. 1.]
-                [1. 1.]]]
-
-            >>> mi_ncubo.marginalizar(dimensiones)
-            NCube(index=0):
-                dims=[0]
-                shape=(2,)
-                data=
-                    [0.75 0.75]
-
-            Se han agrupado los valores del n-cubo por promedio, dejando los remanentes en la dimension 0.
+        Versión híbrida que usa GPU si está disponible, si no usa CPU
         """
-
+        # Validación común
         marginable_axis = np.intersect1d(ejes, self.dims)
         if not marginable_axis.size:
             return self
+            
+        # Cálculo de dimensiones
         numero_dims = self.dims.size - 1
         ejes_locales = tuple(
             numero_dims - dim_idx
@@ -137,12 +278,58 @@ class NCube:
             [d for d in self.dims if d not in marginable_axis],
             dtype=np.int8,
         )
+        
+        # Intentar GPU solo si está disponible e inicializada
+        if CUDA_AVAILABLE and self._CUDA_INITIALIZED:
+            try:
+                input_data = self.data
+                input_size = input_data.size
+                output_shape = [s for i, s in enumerate(self.data.shape) 
+                              if i not in ejes_locales]
+                output_size = np.prod(output_shape)
+                reduce_stride = input_size // output_size
+                
+                # Configurar ejecución
+                block_size = 256
+                grid_size = (output_size + block_size - 1) // block_size
+                
+                # Reservar memoria
+                input_gpu = drv.mem_alloc(input_data.nbytes)
+                output_gpu = drv.mem_alloc(output_size * np.dtype(np.float32).itemsize)
+                drv.memcpy_htod(input_gpu, input_data)
+                
+                # Ejecutar kernel
+                self._marginalize_kernel(
+                    input_gpu, output_gpu,
+                    np.int32(input_size), np.int32(output_size), np.int32(reduce_stride),
+                    block=(block_size, 1, 1), grid=(grid_size, 1)
+                )
+                
+                # Obtener resultados
+                output_data = np.empty(output_shape, dtype=np.float32)
+                drv.memcpy_dtoh(output_data, output_gpu)
+                
+                return NCube(
+                    data=output_data,
+                    dims=new_dims,
+                    indice=self.indice
+                )
+                
+            except Exception as e:
+                print(f"[CUDA] Error en GPU, usando CPU: {str(e)}")
+        
+        # Versión CPU
         return NCube(
             data=np.mean(self.data, axis=ejes_locales, keepdims=False),
             dims=new_dims,
             indice=self.indice,
         )
 
+    def __del__(self):
+            """Limpieza del contexto CUDA"""
+            if self._CUDA_INITIALIZED and self._context:
+                self._context.pop()
+            
     def __str__(self) -> str:
         dims_str = f"dims={self.dims}"
         forma_str = f"shape={self.data.shape}"
